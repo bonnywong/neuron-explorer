@@ -12,6 +12,7 @@ jobs:
       - run: python -m unittest discover -s tests -p 'test_model_lifecycle.py' -v
       - run: python -m unittest discover -s tests -p 'test_model_download.py' -v
       - run: python -m unittest discover -s tests -p 'test_chatgpt_auth.py' -v
+      - run: python -m unittest discover -s tests -p 'test_chat_storage.py' -v
       - uses: actions/setup-node@v4
         with:
           node-version: '20'

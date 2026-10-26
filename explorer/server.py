@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
 from runtime import CACHE, NO_MODEL, Runtime  # noqa: E402
+from chat_storage import read_events, write_events  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
@@ -1368,7 +1369,7 @@ def agent_chats(limit: int = 60):
         path = os.path.join(CODEX_LOGS, f"{os.path.basename(cid)}.jsonl")
         if m.get("agent") != "codex" or not os.path.exists(path):
             continue
-        users = [e for e in map(json.loads, open(path)) if e.get("t") == "user"]
+        users = [e for e in read_events(path) if e.get("t") == "user"]
         if users:
             out.append({"chat": cid, "t": int(os.path.getmtime(path)), "title": users[0]["text"].strip()[:120], "turns": len(users), "agent": "codex"})
     return sorted(out, key=lambda c: -c["t"])[:limit]
@@ -1379,7 +1380,7 @@ def agent_history(chat: str):
     """A past chat as the events a live turn streams (text, tool, tool_result), with a user event per message."""
     if _meta().get(chat, {}).get("agent") == "codex":
         path = os.path.join(CODEX_LOGS, f"{os.path.basename(chat)}.jsonl")
-        ev = [e for e in map(json.loads, open(path)) if e.get("t") in ("user", "text", "tool", "tool_result")] if os.path.exists(path) else []
+        ev = [e for e in read_events(path) if e.get("t") in ("user", "text", "tool", "tool_result")] if os.path.exists(path) else []
         return {"chat": chat, "agent": "codex", "events": ev}
     path = _session_file(chat)
     if not path:
@@ -1433,11 +1434,10 @@ async def agent_rewind(req: Request):
             _meta_set(sid, turns=turns[:-1])
         path = os.path.join(CODEX_LOGS, f"{os.path.basename(sid)}.jsonl")
         if os.path.exists(path):
-            ev = [json.loads(x) for x in open(path)]
+            ev = read_events(path)
             last = max((i for i, e in enumerate(ev) if e.get("t") == "user"), default=None)
             if last is not None:
-                with open(path, "w") as f:
-                    f.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in ev[:last])
+                write_events(path, ev[:last])
         return {"ok": True, "cut": bool(turns)}
     if sid in _chats:  # a live process holds the conversation in memory; the next message resumes from the cut file
         await _end_chat(_chats[sid])
@@ -1526,8 +1526,7 @@ def _chat(cid, agent=None):
 
 def _codex_log(cid, ev):
     os.makedirs(CODEX_LOGS, exist_ok=True)
-    with open(os.path.join(CODEX_LOGS, f"{os.path.basename(cid)}.jsonl"), "a") as f:
-        f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    write_events(os.path.join(CODEX_LOGS, f"{os.path.basename(cid)}.jsonl"), [ev], append=True)
 
 
 def _emit(c, ev):
