@@ -17,6 +17,8 @@ from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l2norm
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+if MODEL != "Qwen/Qwen3.5-4B":
+    raise ValueError("This release supports only Qwen/Qwen3.5-4B. Remove EXPLORER_MODEL.")
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -63,21 +65,30 @@ class Runtime:
         self._capture_heads = None  # while set: each layer's query/key side and each head's write size, per token
         self.heads = None  # the last text's captures: {"T", "q", "writes"}, see full_activations(heads=True)
         self._lens_cache = {}
+        self.hook_count = 0
 
     # ---------- loading ----------
     def ensure_loaded(self):
-        if self.model is not None:
-            return
-        if NO_MODEL:
-            raise RuntimeError("live model disabled (EXPLORER_NO_MODEL)")
+        if self.model is None or getattr(self, "cancel", threading.Event()).is_set():
+            raise RuntimeError("Qwen is not ready. Open Model & setup and start it first.")
+
+    def load(self, snapshot, device):
         with self.lock:
             if self.model is not None:
                 return
+            if NO_MODEL:
+                raise RuntimeError("Live execution disabled by EXPLORER_NO_MODEL")
             self.status = "loading"
-            dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
+            with open(os.path.join(snapshot, "config.json"), encoding="utf-8") as config_file:
+                config = json.load(config_file).get("text_config", {})
+            if (config.get("num_hidden_layers"), config.get("hidden_size"), config.get("intermediate_size")) != (32, 2560, 9216):
+                raise RuntimeError("Downloaded architecture differs from the supported Qwen3.5-4B architecture")
+            self.cancel = getattr(self, "cancel", threading.Event())
+            dtype = torch.float32 if device == "cpu" else (torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else torch.float16)
+            self.precision = str(dtype).replace("torch.", "")
+            self.tok = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+            m = Qwen3_5ForConditionalGeneration.from_pretrained(snapshot, dtype=dtype, local_files_only=True).to(device).eval().requires_grad_(False)
+            self.dev, self.model, self.lm = device, m, m.model.language_model
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
                 layer.register_forward_hook(self._resid_hook(i))
@@ -93,7 +104,36 @@ class Runtime:
                 if hasattr(layer, "linear_attn"):
                     a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
                 layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
+            self.hook_count = sum(len(module._forward_hooks) + len(module._forward_pre_hooks) for module in self.lm.modules())
             self.status = "ready"
+
+    def warmup(self):
+        with self.lock, torch.inference_mode():
+            ids = self.tok("Hello", return_tensors="pt").input_ids.to(self.dev)
+            self._capture_all = {}
+            try:
+                out = self.model(input_ids=ids, use_cache=False, logits_to_keep=1)
+                if not torch.isfinite(out.logits).all() or len(self._capture_all) != len(self.lm.layers):
+                    raise RuntimeError("Inference or neuron hook check failed")
+            finally:
+                self._capture_all = None
+
+    def unload(self):
+        import gc
+        with self.lock:
+            # Reinitialize transient runtime state, retaining the existing cache database.
+            db, db_lock, stats, lock, cancel = self._db, self._db_lock, self.stats_dir, self.lock, getattr(self, "cancel", threading.Event())
+            self.__dict__.clear()
+            self.__init__(stats)
+            self._db.close()
+            self._db, self._db_lock = db, db_lock
+            self.lock, self.cancel = lock, cancel
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            self.status = "stopped"
 
     def _hook(self, i):
         def hook(mod, inp):
@@ -195,6 +235,7 @@ class Runtime:
             return None
         return hook
 
+    @_locked
     def head_row(self, layer, head, pos):
         with self.lock:
             return self._head_row(layer, head, pos)
@@ -220,6 +261,7 @@ class Runtime:
                 u = d[j] * (u - beta[j] * dot * k[j])
             return (row / row.abs().sum().clamp(min=1e-12)).cpu().tolist()
 
+    @_locked
     def head_pattern(self, layer, head):
         with self.lock:
             return self._head_pattern(layer, head)
@@ -250,6 +292,7 @@ class Runtime:
             A = A / A.abs().sum(-1, keepdim=True).clamp(min=1e-12)
             return A.cpu().numpy()
 
+    @_locked
     def raw_row(self, layer, head, pos, caps=None):
         """(Called with the model lock held.) The attention row of one head at token `pos`, unscaled: softmax weights (full attention) or the exact
         effective weights (linear attention), so that the head's output there is scale * sum_j row[j] * v_j."""
@@ -268,6 +311,7 @@ class Runtime:
                 u = d[j] * (u - beta[j] * dot * k[j])
             return row
 
+    @_locked
     def attn_drive(self, layer, n, pos, caps=None, top=6):
         with self.lock:
             return self._attn_drive(layer, n, pos, caps, top)
@@ -307,6 +351,7 @@ class Runtime:
             return {"act": float(g * sg * u), "total": float((sg * (1 + g * (1 - sg)) * g + g * sg) * u),
                     "heads": out, "src": src}
 
+    @_locked
     def layer_patterns(self, layer, caps=None):
         with self.lock:
             return self._layer_patterns(layer, caps)
@@ -430,7 +475,9 @@ class Runtime:
                 for h, (WV, WO) in enumerate(heads):
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
                     spans.append((l, h, at, at + hd)); at += hd
-        self._hb = (torch.cat(qv, 1).to(self.dev), torch.cat(qo, 1).to(self.dev), spans)
+        # Static weight-analysis bases are large and are not part of model inference.
+        # Keep these CPU analyses in host memory so they do not crowd out generation.
+        self._hb = (torch.cat(qv, 1), torch.cat(qo, 1), spans)
         return self._hb
 
     @_locked
@@ -445,8 +492,8 @@ class Runtime:
             d = me.mlp.down_proj.weight[:, n].float()
             w = 1.0 + me.post_attention_layernorm.weight.float()
             gr, ur = me.mlp.gate_proj.weight[n].float() * w, me.mlp.up_proj.weight[n].float() * w
-            pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
-            pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
+            pr = QV.T @ d.cpu()  # projections of the down column on every head's read basis
+            pg, pu = QO.T @ gr.cpu(), QO.T @ ur.cpu()
         dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
         reads, writes = [], []
         for l, h, a, b in spans:
@@ -496,7 +543,7 @@ class Runtime:
                     for W, hs in units:
                         cols.append(torch.linalg.qr((W.float() * g).T.cpu())[0].half())
                         spans.append((l, hs, at, at + W.shape[0])); at += W.shape[0]
-                out[role] = (torch.cat(cols, 1).to(self.dev), spans)
+                out[role] = (torch.cat(cols, 1), spans)
         self._qkb = out
         return out
 
@@ -511,7 +558,7 @@ class Runtime:
         with self.lock, torch.inference_mode():
             d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
             dn = float(d.norm())
-            proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items()}
+            proj = {r: (B.T @ d.half().cpu()).float() for r, (B, _) in qk.items()}
         roles = {}
         for r, (_, spans) in qk.items():  # shares relative to a random direction's, as in neuron_heads
             side = [(l, hs, float(proj[r][a:b].norm()) / dn / ((b - a) / d.shape[0]) ** 0.5) for l, hs, a, b in spans if l > layer]
@@ -536,6 +583,7 @@ class Runtime:
             roles[r] = rows
         return roles
 
+    @_locked
     def n_heads(self, layer):
         L = self.lm.layers[layer]
         return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
@@ -567,9 +615,11 @@ class Runtime:
         return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
 
     # ---------- steering ----------
+    @_locked
     def chat_ids(self, prompt):
         return self.messages_ids([{"role": "user", "content": prompt}])
 
+    @_locked
     def messages_ids(self, messages):
         enc = self.tok.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False, tokenize=True)
         return list(enc["input_ids"] if hasattr(enc, "keys") else enc)
@@ -580,16 +630,16 @@ class Runtime:
         Yields (row, text_delta), then (None, None)."""
         yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
 
-    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
+    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None, row_signs=(1, 0, -1)):
         """steer_stream for any number of neurons at once: pushes = [(layer, n, dose, mode)], all applied together.
         Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose)."""
-        self.ensure_loaded()
         with self.lock:
-            if cancel is not None and cancel.is_set():
+            self.ensure_loaded()
+            if (cancel is not None and cancel.is_set()) or self.cancel.is_set():
                 yield None, None
                 return
             try:
-                push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
+                push = [self._push_entry(layer, n, dose, mode, row_signs) for layer, n, dose, mode in pushes]
                 seqs = [self.messages_ids(m) for m in rows_messages]
                 T = max(map(len, seqs))
                 pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
@@ -597,16 +647,16 @@ class Runtime:
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
                 eos = self.tok.convert_tokens_to_ids("<|im_end|>")
-                done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
+                done, out_ids, sent = [False] * len(row_signs), [[] for _ in row_signs], [""] * len(row_signs)
                 self._push = push
                 with torch.inference_mode():
                     out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
                                      logits_to_keep=1)
                     for _ in range(max_new):
-                        if cancel is not None and cancel.is_set():
+                        if (cancel is not None and cancel.is_set()) or self.cancel.is_set():
                             break
                         nxt = out.logits[:, -1].argmax(-1)
-                        for r in range(3):
+                        for r in range(len(row_signs)):
                             if done[r]:
                                 continue
                             t = int(nxt[r])
@@ -628,6 +678,7 @@ class Runtime:
                 self._push = None
         yield None, None
 
+    @_locked
     def token_units(self, ids):
         """Groups token ids into displayable units: byte-level pieces of one multi-byte character (emoji, CJK split
         across tokens) join the token that completes it. Returns [(text, [token indices])]."""
@@ -663,6 +714,7 @@ class Runtime:
             vals = [r * dose * unit for r in rows]
         return (layer, n, mode, torch.tensor(vals, device=self.dev))
 
+    @_locked
     def read(self, layer, n, text, chat=True, pushes=None, heads=None):
         """Per-token activation of neuron n at `layer` on `text` (as a user turn when chat=True), optionally with other
         neurons pushed at the same time: pushes = [(layer, n, dose, mode)], the same units as steering (n None = the
@@ -692,6 +744,7 @@ class Runtime:
             units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
         return {"units": units}
 
+    @_locked
     def next_logprobs(self, text, chat=True, prefix="", pushes=None, heads=None):
         """Log-probabilities of the next token after `text` (as a user turn when chat=True, so the next token opens the
         reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
@@ -883,12 +936,13 @@ class Runtime:
                 self._vocab = json.load(open(path))
             else:
                 if self.tok is None:
-                    self.tok = AutoTokenizer.from_pretrained(MODEL)
+                    self.ensure_loaded()
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
                 json.dump(self._vocab, open(path, "w"))
         return self._vocab
 
     # ---------- which neurons fire on a text ----------
+    @_locked
     def all_activations(self, ids, skip_first=False):
         """Per layer: (max, argmax, min, argmin) over tokens for every neuron, on token ids [T] or [B, T]. With
         skip_first, position 0 (the attention sink) is left out and argmax/argmin count from position 1."""
@@ -924,6 +978,7 @@ class Runtime:
         self.status = "ready"
         return path
 
+    @_locked
     def full_activations(self, ids, heads=False):
         """Every neuron's activation at every token: float32 array [layers, tokens, inter]. With heads, the same pass
         also keeps what head_row() needs and every head's write size per token (self.heads)."""

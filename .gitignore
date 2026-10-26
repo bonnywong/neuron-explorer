@@ -27,3 +27,7 @@ explorer/cache/head_profiles.json
 
 # experiment scripts
 scripts/
+
+.model-cache/
+.setup-state.json
+.bootstrap/
