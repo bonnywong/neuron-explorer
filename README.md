@@ -22,12 +22,37 @@ steered chat, lens, connections and live inference over your own text.
 - **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
   connections, and a name.
 - **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
+- **ChatGPT / Claude** (fourth neuron-panel tab, or the right-edge handle): a chat using the `codex` CLI with your
+  ChatGPT login by default, or the `claude` CLI when selected, with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
   live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
   tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
   `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
   `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+
+### ChatGPT subscription chat
+
+The assistant panel defaults to **ChatGPT**, with **ChatGPT (via Codex)** selected in
+the provider menu. It uses the local Codex CLI signed in with your ChatGPT account,
+and counts toward your plan's Codex usage limits. No API key is needed; API-key
+logins are rejected for this option. Claude remains available in the provider menu.
+
+Install the [Codex CLI](https://learn.chatgpt.com/docs/cli) and start the explorer.
+Open the **ChatGPT** panel (or the right-edge handle), click **Sign in with ChatGPT**,
+and finish signing in in the browser tab. The panel shows the connected account
+and plan. If a popup is blocked, use **Continue sign-in**. Pending sign-ins can be
+cancelled; connection failures show a retry button and missing CLI installations
+show an installation link.
+
+**Sign out** stops running ChatGPT conversations and removes this explorer's login.
+It does not sign you out of the Codex desktop app or CLI. Credentials are stored
+only in the explorer's Git-ignored `explorer/cache/agent/codex-home/`; the app no
+longer imports your CLI login automatically. A login saved by the previous version
+is retained, with any credential symlink detached before use.
+
+This remains a personal, local application: browser tabs on the same explorer
+server share its login. Separate users should run their own local instances.
+ChatGPT can inspect the bundled cached data in cache-only mode; live model
+experiments still require Qwen model weights and an enabled runtime.
 
 ## Sweep
 

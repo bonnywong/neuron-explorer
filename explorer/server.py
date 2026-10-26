@@ -1181,16 +1181,16 @@ AGENT_LOCAL = os.path.join(ROOT, "explorer", "agent_prompt.local.md")  # this ma
 def agent_prompt_file():
     """agent_prompt.md, then agent_methodology.md and agent_prompt.local.md when present, with {ROOT} filled in as
     this checkout's path, written beside the chat's working files."""
-    text = open(AGENT_PROMPT).read()
+    text = open(AGENT_PROMPT, encoding="utf-8").read()
     for extra in (AGENT_METHOD, AGENT_LOCAL):
         if os.path.exists(extra):
-            text = text.rstrip() + "\n\n" + open(extra).read()
+            text = text.rstrip() + "\n\n" + open(extra, encoding="utf-8").read()
     text = text.replace("{ROOT}", ROOT)
     out = os.path.join(AGENT_DIR, "system_prompt.md")
-    if not os.path.exists(out) or open(out).read() != text:
+    if not os.path.exists(out) or open(out, encoding="utf-8").read() != text:
         if os.path.exists(out):
             os.chmod(out, 0o644)
-        with open(out, "w") as f:
+        with open(out, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(out, 0o444)  # generated: edits belong in the source files above
     return out
@@ -1199,6 +1199,14 @@ def agent_prompt_file():
 async def _stop_turn(proc):
     import signal
     if proc is None or proc.returncode is not None:
+        return
+    if os.name == "nt":
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -1507,19 +1515,29 @@ CODEX_HOME = os.path.join(AGENT_DIR, "codex-home")
 
 
 def _codex_home():
-    """Codex's own home for the explorer agent: the person's login, their model and effort, and nothing else (no
-    plugins, apps, memories or global instructions), so its tools are the explorer's and its shell."""
+    """Explorer-owned login and settings, separate from the desktop/CLI login."""
     import tomllib
     os.makedirs(CODEX_HOME, exist_ok=True)
-    auth, src = os.path.join(CODEX_HOME, "auth.json"), os.path.expanduser("~/.codex/auth.json")
-    if not os.path.lexists(auth) and os.path.exists(src):
-        os.symlink(src, auth)
+    auth = os.path.join(CODEX_HOME, "auth.json")
+    if os.path.islink(auth):
+        # Migrate the old shared login without allowing logout to touch CLI credentials.
+        import tempfile
+        with open(auth, "rb") as source:
+            credentials = source.read()
+        fd, temporary = tempfile.mkstemp(dir=CODEX_HOME)
+        try:
+            with os.fdopen(fd, "wb") as target:
+                target.write(credentials)
+            os.replace(temporary, auth)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     try:
         user = tomllib.load(open(os.path.expanduser("~/.codex/config.toml"), "rb"))
     except (OSError, ValueError):
         user = {}
     lines = [f'{k} = {json.dumps(user[k])}' for k in ("model", "model_reasoning_effort") if isinstance(user.get(k), str)]
-    lines += ["", "[features]", "apps = false", "memories = false"]
+    lines += ['forced_login_method = "chatgpt"', 'cli_auth_credentials_store = "file"', "", "[features]", "apps = false", "memories = false"]
     with open(os.path.join(CODEX_HOME, "config.toml"), "w") as f:
         f.write("\n".join(lines) + "\n")
     return CODEX_HOME
@@ -1533,6 +1551,54 @@ You are running as Codex. Your shell and file editing are Codex's own: where the
 Grep, Write, Edit or Bash, use your shell and apply_patch. Start anything that runs longer than about a minute
 detached (`nohup {ROOT}/.venv/bin/python script.py > script.log 2>&1 &`), say where the log is, and end your reply;
 read the log in a later turn."""
+
+
+async def _stop_codex_chats():
+    for c in list(_chats.values()):
+        if c["agent"] == "codex":
+            await _stop_turn(c.get("proc"))
+            c["proc"] = None
+            c["busy"] = False
+            _emit(c, {"t": "done"})
+
+
+from chatgpt_auth import ChatGPTAuth
+
+chatgpt_auth = ChatGPTAuth(_codex_home, AGENT_DIR, _stop_codex_chats)
+
+
+@app.get("/api/chatgpt/status")
+async def chatgpt_status():
+    return await chatgpt_auth.status()
+
+
+async def _auth_action(action):
+    try:
+        return await action()
+    except Exception as exc:
+        chatgpt_auth.error = str(exc)
+        return JSONResponse({"error": str(exc)}, status_code=503)
+
+
+@app.post("/api/chatgpt/login")
+async def chatgpt_login():
+    return await _auth_action(chatgpt_auth.start_login)
+
+
+@app.post("/api/chatgpt/cancel")
+async def chatgpt_cancel():
+    return await _auth_action(chatgpt_auth.cancel_login)
+
+
+@app.post("/api/chatgpt/logout")
+async def chatgpt_logout():
+    return await _auth_action(chatgpt_auth.logout)
+
+
+@app.on_event("shutdown")
+async def _close_chatgpt():
+    await _stop_codex_chats()
+    await chatgpt_auth.close()
 
 
 async def _rpc(c, method, params, timeout=120):
@@ -1620,6 +1686,11 @@ async def _codex_pump(c, proc):
 
 
 async def _ensure_codex(c):
+    async with chatgpt_auth.lock:
+        return await _start_codex_chat(c)
+
+
+async def _start_codex_chat(c):
     proc = c.get("proc")
     if proc is not None and proc.returncode is None:
         return proc
@@ -1631,11 +1702,27 @@ async def _ensure_codex(c):
     c["rpc"] = {"next": 0, "pending": {}}
     c["pump"] = asyncio.create_task(_codex_pump(c, proc))
     await _rpc(c, "initialize", {"clientInfo": {"name": "neuron-explorer", "version": "0.1"}})
+    await _write(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+    account = await _rpc(c, "account/read", {"refreshToken": False})
+    if (account.get("account") or {}).get("type") != "chatgpt":
+        await _stop_turn(proc)
+        c["proc"] = None
+        raise RuntimeError("Use the Sign in with ChatGPT button in the assistant panel, then try again. "
+                           "ChatGPT chat requires a subscription login; API-key billing is not used.")
     mcp = {"explorer": {"command": sys.executable, "args": [os.path.join(ROOT, "explorer", "agent_mcp.py")],
                         "env": {"EXPLORER_URL": f"http://127.0.0.1:{PORT}", "EXPLORER_CHAT": c["session"]}}}
+    with open(agent_prompt_file(), encoding="utf-8") as prompt_file:
+        instructions = prompt_file.read()
     opts = {"cwd": AGENT_DIR, "approvalPolicy": "never", "sandbox": "danger-full-access", "config": {"mcp_servers": mcp},
-            "developerInstructions": open(agent_prompt_file()).read() + CODEX_NOTE.replace("{ROOT}", ROOT)}
-    thread = _meta().get(c["session"], {}).get("thread")
+            "developerInstructions": instructions + CODEX_NOTE.replace("{ROOT}", ROOT)}
+    meta = _meta().get(c["session"], {})
+    email = account["account"].get("email")
+    if meta.get("account_email") and meta["account_email"] != email:
+        await _stop_turn(proc)
+        c["proc"] = None
+        raise RuntimeError("This conversation belongs to another ChatGPT account. Start a new conversation.")
+    _meta_set(c["session"], account_email=email)
+    thread = meta.get("thread")
     r = await _rpc(c, "thread/resume", {"threadId": thread, **opts}) if thread else await _rpc(c, "thread/start", opts)
     c["thread"] = r["thread"]["id"]
     if not thread:

@@ -534,7 +534,7 @@ function syncEdge() {
   const on = focusEl.classList.contains("on"), col = focusEl.classList.contains("collapsed"), f = state.focus;
   const t = $("#focus-tab");
   t.classList.toggle("on", !on || col);
-  t.textContent = on && col && f && f.kind !== "head" ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : "‹ claude";
+  t.textContent = on && col && f && f.kind !== "head" ? `‹ ${f.kind === "random" ? "r" : "N"}${f.n}` : `‹ ${$("#a-agent").value === "codex" ? "ChatGPT" : "Claude"}`;
 }
 $("#list-hide").onclick = () => setListHidden(true);
 $("#list-tab").onclick = () => setListHidden(false);
@@ -909,8 +909,81 @@ await setLayer(first);
 if (location.hash) fromHash(); else restoreFocus();
 
 // ---------- claude: the Claude tab, one claude -p session per conversation ----------
-const agent = { chat: null, kind: "claude", busy: false, sending: 0, box: null, seg: null, segText: "", reply: "", waiters: [] };
+const agent = { chat: null, kind: "codex", busy: false, sending: 0, box: null, seg: null, segText: "", reply: "", waiters: [] };
 const agentEl = $("#tab-claude");
+const chatgptAuth = { connected: false, status: "checking", working: false, authUrl: null, request: 0 };
+function renderChatGPTAuth() {
+  const a = chatgptAuth;
+  $("#a-auth").hidden = agent.kind !== "codex";
+  $("#a-auth").dataset.state = a.status;
+  $("#a-auth-status").textContent = a.connected
+    ? `Connected${a.email ? ` as ${a.email}` : " to ChatGPT"}${a.plan ? ` · ${a.plan}` : ""}${a.error ? ` — ${a.error}` : ""}`
+    : a.status === "checking" ? "Checking ChatGPT connection…"
+    : a.status === "signing_in" ? "Finish signing in in your browser…"
+    : a.error || "Not connected to ChatGPT";
+  $("#a-signin").hidden = a.connected || a.status === "signing_in" || a.cliInstalled === false;
+  $("#a-signin").disabled = a.working || a.status === "checking";
+  $("#a-signout").hidden = !a.connected;
+  $("#a-signout").disabled = a.working;
+  $("#a-auth-cancel").hidden = a.status !== "signing_in";
+  $("#a-auth-cancel").disabled = a.working;
+  $("#a-auth-continue").hidden = a.status !== "signing_in" || !a.authUrl;
+  if (a.authUrl) $("#a-auth-continue").href = a.authUrl;
+  $("#a-auth-retry").hidden = a.status !== "unavailable";
+  $("#a-auth-install").hidden = a.cliInstalled !== false;
+  if (!agent.busy) $("#a-send").disabled = agent.kind === "codex" && (!a.connected || a.working);
+}
+async function refreshChatGPTAuth() {
+  if (chatgptAuth.working || chatgptAuth.refreshing || agent.kind !== "codex") return;
+  chatgptAuth.refreshing = true;
+  const request = ++chatgptAuth.request;
+  try {
+    const result = await api("/api/chatgpt/status");
+    if (request !== chatgptAuth.request) return;
+    Object.assign(chatgptAuth, result);
+    if (result.status !== "signing_in") chatgptAuth.authUrl = null;
+  } catch (error) {
+    if (request !== chatgptAuth.request) return;
+    Object.assign(chatgptAuth, { connected: false, status: "unavailable", error: error.message });
+  } finally {
+    chatgptAuth.refreshing = false;
+  }
+  renderChatGPTAuth();
+}
+async function chatGPTAuthAction(action) {
+  if (chatgptAuth.working) return;
+  // Open synchronously on the click so browser popup blockers allow the login tab.
+  const loginWindow = action === "login" ? window.open("about:blank", "_blank") : null;
+  if (loginWindow) loginWindow.opener = null;
+  chatgptAuth.working = true; ++chatgptAuth.request;
+  renderChatGPTAuth();
+  try {
+    const result = await api(`/api/chatgpt/${action}`, {});
+    if (result.error) throw new Error(result.error);
+    if (action === "login" && result.authUrl) {
+      chatgptAuth.authUrl = result.authUrl;
+      chatgptAuth.status = "signing_in";
+      if (loginWindow) loginWindow.location = result.authUrl;
+    } else if (loginWindow) loginWindow.close();
+    if (action === "logout") {
+      pastStash = null; $("#a-past").classList.remove("on");
+      resetAgent(); clearAgentMarks();
+    }
+  } catch (error) {
+    if (loginWindow) loginWindow.close();
+    Object.assign(chatgptAuth, { error: error.message, status: "unavailable" });
+  } finally {
+    chatgptAuth.working = false;
+    renderChatGPTAuth();
+  }
+  await refreshChatGPTAuth();
+}
+$("#a-signin").onclick = () => chatGPTAuthAction("login");
+$("#a-signout").onclick = () => chatGPTAuthAction("logout");
+$("#a-auth-cancel").onclick = () => chatGPTAuthAction("cancel");
+$("#a-auth-retry").onclick = refreshChatGPTAuth;
+setInterval(() => { if (!document.hidden) refreshChatGPTAuth(); }, 3000);
+addEventListener("focus", refreshChatGPTAuth);
 function mdInline(t) {
   return esc(t).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
     .replace(/\bL(\d{1,2})[ \/]N(\d{1,4})\b/g, (m, l, n) => `<a class="nref" data-l="${l}" data-n="${n}">${m}</a>`);
@@ -937,7 +1010,15 @@ function saveAgent() {
 function setAgentKind(kind) {
   agent.kind = kind === "codex" ? "codex" : "claude";
   $("#a-agent").value = agent.kind;
-  $('#tabs button[data-tab="claude"]').textContent = agent.kind === "codex" ? "Codex" : "Claude";
+  const label = agent.kind === "codex" ? "ChatGPT" : "Claude";
+  $("#a-input").placeholder = `Ask ${label}…`;
+  $("#a-input").title = agent.kind === "codex"
+    ? "Uses your ChatGPT subscription through Codex; Codex plan limits apply"
+    : "Uses your Claude CLI login";
+  syncEdge();
+  $('#tabs button[data-tab="claude"]').textContent = agent.kind === "codex" ? "ChatGPT" : "Claude";
+  renderChatGPTAuth();
+  refreshChatGPTAuth();
 }
 $("#a-agent").addEventListener("change", e => {
   const kind = e.target.value;
@@ -968,7 +1049,7 @@ $("#a-actions").addEventListener("click", e => {
 function resetAgent() {
   closeEvents(); if (agent.busy) finishTurn();
   agent.chat = null; $("#a-thread").innerHTML = EMPTY;
-  let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {}
+  let pref = "codex"; try { pref = localStorage.getItem("explorer.agentKind") || "codex"; } catch {}
   setAgentKind(pref);
   saveAgent();
 }
@@ -1108,6 +1189,10 @@ function finishTurn() {
   for (const w of agent.waiters.splice(0)) w({ reply, box });
 }
 async function agentTurn(message, shown, shownCls = "user", atts = []) {
+  if (agent.kind === "codex" && (!chatgptAuth.connected || chatgptAuth.working)) {
+    openClaude(); $("#a-signin").focus();
+    return { reply: "", box: null };
+  }
   const f = state.focus, th = $("#a-thread");
   if (pastStash !== null) { th.innerHTML = pastStash; pastStash = null; $("#a-past").classList.remove("on"); }
   clearAgentMarks(); clearTurnControls();
@@ -1152,7 +1237,7 @@ async function togglePast() {
   th.innerHTML = `<div class="dim">…</div>`;
   const list = await api("/api/agent/chats");
   if (pastStash === null) return;
-  th.innerHTML = list.length ? list.map(c => `<button class="a-pastrow${c.chat === agent.chat ? " on" : ""}" data-chat="${c.chat}" data-agent="${c.agent || "claude"}"><span class="t">${esc(c.title || "—")}</span><span class="m">${c.agent === "codex" ? "codex · " : ""}${ago(c.t)} · ${c.turns} message${c.turns === 1 ? "" : "s"}</span></button>`).join("")
+  th.innerHTML = list.length ? list.map(c => `<button class="a-pastrow${c.chat === agent.chat ? " on" : ""}" data-chat="${c.chat}" data-agent="${c.agent || "claude"}"><span class="t">${esc(c.title || "—")}</span><span class="m">${c.agent === "codex" ? "ChatGPT · " : "Claude · "}${ago(c.t)} · ${c.turns} message${c.turns === 1 ? "" : "s"}</span></button>`).join("")
     : `<div class="dim">—</div>`;
 }
 async function openPast(chat, kind) {
@@ -1192,6 +1277,9 @@ async function explainFocus() {
   }
 }
 function sendChat() {
+  if (agent.kind === "codex" && (!chatgptAuth.connected || chatgptAuth.working)) {
+    openClaude(); $("#a-signin").focus(); return false;
+  }
   const msg = $("#a-input").value.trim();
   if (agent.pending.some(a => !a.id) || (!msg && !agent.pending.length)) return false;
   const atts = agent.pending; agent.pending = []; renderPending();
@@ -1202,6 +1290,7 @@ function sendChat() {
 function setSendMode(busy) {
   const b = $("#a-send"); b.disabled = false; b.classList.toggle("stop", busy);
   b.textContent = busy ? "■" : "↑"; b.title = busy ? "stop" : "send"; b.setAttribute("aria-label", busy ? "stop" : "send");
+  renderChatGPTAuth();
 }
 
 // ---- attachments: picked, dropped or pasted files upload right away and go with the next message ----
@@ -1269,6 +1358,6 @@ $("#a-input").addEventListener("keydown", e => {
 $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.busy) stopAgent(); else sendChat(); });
 $("#a-new").onclick = () => { pastStash = null; $("#a-past").classList.remove("on"); resetAgent(); clearAgentMarks(); };
 $("#a-past").onclick = togglePast;
-{ let pref = "claude"; try { pref = localStorage.getItem("explorer.agentKind") || "claude"; } catch {} setAgentKind(pref); }
+{ let pref = "codex"; try { pref = localStorage.getItem("explorer.agentKind") || "codex"; } catch {} setAgentKind(pref); }
 loadAgent(); renderAgentActions(); openEvents();
 syncEdge(); updateInsets();
