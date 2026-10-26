@@ -2,8 +2,9 @@
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault('EXPLORER_NO_MODEL','1')
 os.environ.setdefault('HF_HUB_OFFLINE','1')
@@ -53,6 +54,32 @@ class ModelAPITests(unittest.TestCase):
             result=self.client.post('/api/steer',json={'layer':22,'n':2742,'prompt':'Hello','dose':.8})
             self.assertIn('error',result.text)
             self.assertEqual(server.models.active_requests,0)
+
+    def test_assistant_unicode_send_stream_history_and_rewind(self):
+        text = 'dose × median(‖resid‖) / ‖W_down[:, n]‖ 🧠 你好'
+        reply = 'Δ activation → −1 🧠'
+        with tempfile.TemporaryDirectory() as directory:
+            chat = {'session':'unicode-test', 'agent':'codex', 'proc':None,
+                    'listeners':set(), 'turn':[], 'busy':False, 'last':0, 'thread':'mock-thread'}
+            with patch.object(server, 'CODEX_LOGS', directory), \
+                 patch.object(server, 'CHAT_META', str(Path(directory) / 'chats.json')), \
+                 patch.object(server, '_chat', return_value=chat), \
+                 patch.object(server, '_ensure_proc', new_callable=AsyncMock), \
+                 patch.object(server, '_end_chat', new_callable=AsyncMock), \
+                 patch.object(server, '_rpc', new_callable=AsyncMock, return_value={'turn':{'id':'mock-turn'}}) as rpc:
+                server._meta_set('unicode-test', agent='codex')
+                result = self.client.post('/api/agent/send', json={'chat':'unicode-test', 'agent':'codex', 'message':text})
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json(), {'ok':True})
+                self.assertEqual(rpc.call_args.args[2]['input'][0]['text'], text)
+                server._emit(chat, {'t':'text', 'text':reply})
+                history = self.client.get('/api/agent/history?chat=unicode-test').json()['events']
+                self.assertEqual([event['text'] for event in history], [text, reply])
+                chats = self.client.get('/api/agent/chats').json()
+                self.assertEqual(next(c for c in chats if c['chat'] == 'unicode-test')['title'], text)
+                result = self.client.post('/api/agent/rewind', json={'chat':'unicode-test', 'text':text})
+                self.assertTrue(result.json()['cut'])
+                self.assertEqual(self.client.get('/api/agent/history?chat=unicode-test').json()['events'], [])
 
 
 if __name__ == '__main__': unittest.main()
