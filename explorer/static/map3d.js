@@ -511,7 +511,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     dir.normalize();
     const t0 = performance.now();
     (function step(t) {
-      const k = Math.min(1, (t - t0) / 450), e = k * k * (3 - 2 * k);
+      const k = matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : Math.min(1, (t - t0) / 450), e = k * k * (3 - 2 * k);
       controls.target.lerpVectors(from, to, e);
       camera.position.copy(controls.target).addScaledVector(dir, d0 + (dist - d0) * e);
       controls.update(); render();
@@ -527,7 +527,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     const from = controls.target.clone(), p0 = camera.position.clone();
     const p1 = c.clone().add(new THREE.Vector3(dist, 0.0001, 0)), t0 = performance.now();
     (function step(t) {
-      const k = Math.min(1, (t - t0) / 600), e = k * k * (3 - 2 * k);
+      const k = matchMedia('(prefers-reduced-motion: reduce)').matches ? 1 : Math.min(1, (t - t0) / 600), e = k * k * (3 - 2 * k);
       controls.target.lerpVectors(from, c, e); camera.position.lerpVectors(p0, p1, e);
       controls.update(); render();
       if (k < 1) requestAnimationFrame(step);
@@ -626,7 +626,7 @@ export function createMap(canvas, labelsDiv, arch, cb) {
     // fly close to one neuron, keeping the current viewing direction
     flyToNeuron(layer, n, closeness = 0.22) { flyTo(neuronPos(layer, n), homeDist * closeness); },
     get layerMode() { return layerMode; },
-    home() { flyTo(home.target, homeDist); },
+    home() { controls.target.copy(home.target); fitPerPx = null; resize(); controls.update(); render(); },
     setMarks(marks) {
       lastMarks = marks;
       const p = [], c = [], up = new THREE.Color(1.0, 0.71, 0.28), down = new THREE.Color(1.0, 0.31, 0.6);

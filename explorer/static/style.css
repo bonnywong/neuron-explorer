@@ -13,6 +13,60 @@
   --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, monospace;
 }
+
+/* Local setup, authored help and live tutorial share the explorer's palette. */
+[hidden] { display: none !important; }
+header { flex-wrap: wrap; height: auto !important; min-height: 64px; gap: 7px !important; padding: 8px 12px !important; background: #080a0e; }
+main { top: 88px !important; }
+#list, #focus { top: 96px !important; }
+#model-open, #help-open { border: 1px solid #444; border-radius: 5px; padding: 5px 9px; }
+.help-dot { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; flex-shrink: 0; border: 1px solid #555; color: #bbb; border-radius: 50%; font-size: 12px; }
+.learn-dialog, .learn-panel { background: #11151b; color: var(--ink); border: 1px solid #3d454e; border-radius: 12px; padding: 24px; box-shadow: 0 16px 60px #0009; line-height: 1.6; }
+.learn-dialog { width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; }
+.learn-dialog::backdrop { background: #0009; }
+#help-dialog { position: fixed; inset: 0 0 0 auto; margin: 0; width: min(540px, 100vw); max-height: 100dvh; height: 100dvh; border-radius: 12px 0 0 12px; }
+.learn-dialog h2, .learn-panel h2 { margin: 0 0 12px; color: #f2f3f5; font-size: 21px; }
+.learn-dialog h3, .learn-panel h3 { margin: 0 0 8px; font-size: 15px; }
+.learn-heading { display: flex; gap: 20px; align-items: baseline; justify-content: space-between; }
+.learn-dialog p, .learn-panel p { margin: 10px 0; }
+.learn-dialog button:not(.help-dot), .learn-panel button { padding: 7px 12px; border: 1px solid #51575f; border-radius: 5px; color: #eee; background: #202630; }
+.learn-dialog button:hover, .learn-panel button:hover { background: #343d49; }
+.learn-dialog button:disabled, .learn-panel button:disabled { opacity: .45; cursor: default; }
+.learn-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 8px; }
+.learn-dialog article { padding: 16px; margin: 14px 0; background: #171d24; border-radius: 7px; }
+.learn-dialog dl { display: grid; grid-template-columns: 140px 1fr; gap: 6px 14px; font-size: 12px; }
+.learn-dialog dd { margin: 0; overflow-wrap: anywhere; }
+.learn-dialog dt { color: var(--dim); }
+.status-pill { margin-left: 8px; color: var(--up); font-size: 12px; font-weight: normal; }
+.learn-dialog progress { display: block; width: 100%; accent-color: var(--up); margin: 8px 0; }
+.learn-dialog label, .learn-panel label { display: block; margin-top: 10px; color: #ccc; }
+.learn-dialog input, .learn-panel input, .learn-panel textarea, .learn-dialog select { padding: 8px; width: 100%; margin-bottom: 10px; color: var(--ink); background: #222a34; border: 1px solid #48505b; border-radius: 5px; font: inherit; }
+.learn-panel { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); width: min(740px, calc(100vw - 40px)); max-height: 55dvh; overflow: auto; z-index: 12; }
+.demo-columns { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; margin-top: 18px; }
+.demo-columns article { padding: 10px; background: #0c1016; border-top: 2px solid #777; font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.demo-columns article:first-child { border-color: var(--up); }.demo-columns article:last-child { border-color: var(--down); }
+.learn-panel pre { font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#demo-error, #model-error { color: #ff9bbd; }
+#demo-activation { margin-top: 15px; white-space: pre-wrap; }
+#demo-activation span:focus-visible { outline: 2px solid white; }
+#help-tooltip { position: fixed; max-width: 310px; padding: 12px; background: #252d38; color: #fff; border: 1px solid #697586; border-radius: 6px; z-index: 30; pointer-events: none; font-size: 12px; }
+.tour-target { outline: 2px solid var(--up) !important; outline-offset: 3px; }
+[aria-disabled="true"] { opacity: .6; }
+@media (max-width: 900px) {
+  header { max-height: 144px; overflow: auto; }
+  main { top: 144px !important; }
+  #list, #focus { top: 152px !important; }
+  #status { display: none; }
+  .learn-panel { max-height: 48dvh; padding: 16px; bottom: 8px; }
+  .demo-columns { gap: 5px; }.demo-columns article { padding: 5px; }
+}
+@media (max-width: 520px) {
+  .learn-dialog { padding: 16px; }.learn-dialog dl { grid-template-columns: 1fr; gap: 3px; }
+  .learn-dialog dd { margin-bottom: 8px; }
+  #list { max-width: 43vw; } #focus { max-width: 52vw; }
+  .demo-columns { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; } }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--font); overflow: hidden; }
 button, input, select { font: inherit; color: inherit; }

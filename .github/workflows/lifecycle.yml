@@ -1,0 +1,18 @@
+name: Lightweight lifecycle checks
+on: [push, pull_request]
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install huggingface_hub==1.33.0 tqdm==4.70.1 safetensors==0.8.0
+      - run: python -m unittest discover -s tests -p 'test_model_lifecycle.py' -v
+      - run: python -m unittest discover -s tests -p 'test_model_download.py' -v
+      - run: python -m unittest discover -s tests -p 'test_chatgpt_auth.py' -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test tests/experiments.test.mjs

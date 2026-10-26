@@ -1,16 +1,19 @@
+import { streamSteering, readNeuron, activationHTML } from "./experiments.js";
+import { initOnboarding } from "./onboarding.js";
 import { createMap } from "./map3d.js?v=78";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
   const r = await fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
-  if (!r.ok) throw new Error(`${p.split("?")[0]} ${r.status}: ${(await r.text()).slice(0, 160)}`);
+  if (!r.ok) { const err = await r.json().catch(() => ({})); throw new Error(err.error || `${p.split("?")[0]} ${r.status}`); }
   return r.json();
 };
 addEventListener("unhandledrejection", e => { const el = document.querySelector("#status"); if (el) el.textContent = String(e.reason?.message || e.reason); });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDose = d => (d > 0 ? "+" : d < 0 ? "−" : "") + Math.abs(d);
 
+let modelReady = false;
 let agentSelecting = false, agentMarked = false;  // Claude's selections and marks (see agentUi); declared early, openNeuron reads them on load
 const state = { layer: null, units: {}, unitMap: {}, focus: null, view: "map", chat: { mode: "add", dir: "writes", dose: { add: 0.8, mul: 2 } } };
 const ADD_STEPS = [...Array.from({ length: 30 }, (_, i) => +((i + 1) * 0.05).toFixed(2)), 1.75, 2, 2.5, 3, 4, 5];
@@ -33,6 +36,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
   onHover: (p, x, y) => {
     if (!p) return hideTip();
     if (p.type === "head") {
+      if (!modelReady) return showTip(x, y, `L${p.layer} h${p.head}`, "Attention head · start Qwen in Model & setup to inspect live.");
       if (hoverKey !== `h/${p.layer}/${p.head}`) map.setHoverConnections(null);
       const key = `h/${p.layer}/${p.head}`, head = `L${p.layer} h${p.head}`;
       const body = () => {
@@ -78,7 +82,7 @@ const map = createMap($("#map"), $("#layer-labels"), arch, {
     clearTimeout(hoverTimer);
     hoverTimer = setTimeout(async () => {
       const [hv, nh] = await Promise.all([hoverCache.get(key) || api(`/api/hover?layer=${p.layer}&n=${p.n}`),
-        hoverCache.get(`nh/${key}`) || api(`/api/neuron/heads?layer=${p.layer}&n=${p.n}`)]);
+        hoverCache.get(`nh/${key}`) || (modelReady ? api(`/api/neuron/heads?layer=${p.layer}&n=${p.n}`) : Promise.resolve({}))]);
       hoverCache.set(key, hv); hoverCache.set(`nh/${key}`, nh);
       if (hoverKey !== key) return;
       // with a neuron or head open, hover only shows the tooltip; its links and web stay on screen
@@ -213,7 +217,7 @@ async function loadEmbeddings() {
   $("#embed-empty").textContent = "…";
   const d = index.layers[l] ? await api(`/api/embeddings?layer=${l}`) : {};
   if (state.layer !== l) return;
-  $("#embed-empty").textContent = d.x ? "" : "—";
+  $("#embed-empty").innerHTML = d.x ? "" : 'No experiment embeddings installed. Starting Qwen enables live experiments but does not recreate the original sweep. <button data-help="embeddings">Learn more</button>';
   scatter.setData(d.x ? { ...d, layer: l } : null);
   scatter.select(state.layer, state.focus?.layer === state.layer ? state.focus.n : null);
 }
@@ -601,12 +605,13 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   renderExamples(u);
   renderDetails(u);
   const hasRollouts = !!(u.rollouts && u.rollouts.length);
-  document.querySelector('#tabs button[data-tab="examples"]').style.display = hasRollouts ? "" : "none";
+  document.querySelector('#tabs button[data-tab="examples"]').style.display = "";
   if (!hasRollouts && document.querySelector("#tabs button.on")?.dataset.tab === "examples") setTab("details");
   if (kind === "neuron") loadLive(layer, n);
 }
 // the heads linked to the open neuron light up on their slabs (see /api/neuron/heads)
 async function loadNeuronHeads(layer, n) {
+  if (!modelReady) return;
   state.nheads = null; lightHeads(tokHover ?? state.inf.pos);
   const r = await api(`/api/neuron/heads?layer=${layer}&n=${n}`);
   if (!isFocus(layer, n, "neuron")) return;
@@ -620,6 +625,7 @@ async function loadNeuronHeads(layer, n) {
 // a head opens in the list panel: its id up top, what it reads and writes in net, and on run the text shaded by
 // where it reads from; the neuron panel steps aside unless Claude is showing
 async function openHead(layer, head) {
+  if (!modelReady) { document.dispatchEvent(new Event("open-model-setup")); return; }
   if (!agentSelecting) clearAgentMarks();
   flushName();
   if (running) running.abort();
@@ -645,7 +651,7 @@ async function openHead(layer, head) {
 const isFocus = (layer, n, kind) => state.focus && state.focus.layer === layer && state.focus.n === n && state.focus.kind === kind;
 
 function renderExamples(u) {
-  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">—</div>`; return; }
+  if (!u.rollouts || !u.rollouts.length) { $("#tab-examples").innerHTML = `<div class="slot">No sweep examples installed. Qwen can still run new experiments in Neuron chat. <button data-help="data">Learn about experiment data</button></div>`; return; }
   const prompts = Object.keys(u.prompts).filter(p => u.rollouts.some(r => r.prompt === p));
   const count = {};
   for (const r of u.rollouts) count[r.dose] = (count[r.dose] || 0) + 1;
@@ -673,7 +679,7 @@ $("#tab-examples").addEventListener("click", e => { const c = e.target.closest("
 
 function renderDetails(u) {
   const s = u.stats;
-  let h = "";
+  let h = `<p class="dim">Precomputed reference lenses and connections. Links are hypotheses about influence. <button data-help="lenses">Learn more</button></p>`;
   if (s) {
     h += `<div class="lab">words</div><div class="crumbs">` + s.words.map(([w, c, z]) =>
       `<span class="tok" title="${c} rollouts · z ${z.toFixed(1)} · ${esc((s.per_prompt[w] || []).join(" "))}">${esc(w)}</span>`).join("") + `</div>`;
@@ -840,26 +846,11 @@ $("#c-form").addEventListener("submit", async e => {
   const ctl = new AbortController(), thread = state.thread;
   running = ctl; $("#c-go").textContent = "stop";
   try {
-    const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
-      body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history }) });
-    if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read(); if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let k;
-      while ((k = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, k); buf = buf.slice(k + 2);
-        if (!line.startsWith("data: ")) continue;
-        const ev = JSON.parse(line.slice(6));
-        if (ev.error) turn.error = ev.error;
-        if (ev.row == null) continue;
-        turn.replies[ev.row] += ev.t;
-        cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
-        const th = $("#c-thread"); if (th.scrollHeight - th.scrollTop - th.clientHeight < 80) th.scrollTop = th.scrollHeight;
-      }
-    }
+    await streamSteering({ layer:f.layer, n:f.n, prompt:text, dose, mode:state.chat.mode, history }, ctl.signal, ev => {
+      if (ev.row == null) return;
+      turn.replies[ev.row] += ev.t;
+      cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
+    });
   } catch (err) {
     if (err.name !== "AbortError") turn.error = String(err);
   } finally {
@@ -873,15 +864,11 @@ async function runReads(f, text) {
   if (reading) return;
   reading = true; $("#c-go").textContent = "…";
   let r;
-  try { r = await api("/api/reads", { layer: f.layer, n: f.n, text, chat: true }); }
+  try { r = await readNeuron(f, text); }
   catch (err) { $("#c-reads").textContent = err.message; return; }
   finally { reading = false; $("#c-go").textContent = "run"; }
   if (!isFocus(f.layer, f.n, "neuron")) return;
-  const m = Math.max(1e-6, ...r.units.map(u => Math.abs(u.act)));
-  $("#c-reads").innerHTML = r.units.map(u => {
-    const a = u.act / m, c = a >= 0 ? `rgba(255,181,71,${a * 0.85})` : `rgba(255,79,154,${-a * 0.85})`;
-    return `<span style="background:${c}" title="${u.pieces.map(v => v.toFixed(3)).join(" · ")}">${esc(u.text)}</span>`;
-  }).join("");
+  $("#c-reads").innerHTML = activationHTML(r);
 }
 
 // ---------- status ----------
@@ -1016,7 +1003,7 @@ function setAgentKind(kind) {
     ? "Uses your ChatGPT subscription through Codex; Codex plan limits apply"
     : "Uses your Claude CLI login";
   syncEdge();
-  $('#tabs button[data-tab="claude"]').textContent = agent.kind === "codex" ? "ChatGPT" : "Claude";
+  $('#tabs button[data-tab="claude"]').textContent = "AI assistant";
   renderChatGPTAuth();
   refreshChatGPTAuth();
 }
@@ -1361,3 +1348,44 @@ $("#a-past").onclick = togglePast;
 { let pref = "codex"; try { pref = localStorage.getItem("explorer.agentKind") || "codex"; } catch {} setAgentKind(pref); }
 loadAgent(); renderAgentActions(); openEvents();
 syncEdge(); updateInsets();
+
+// The tour uses the same selection, generation and activation functions as the explorer.
+initOnboarding({
+  onStatus(status) {
+    const wasReady = modelReady;
+    modelReady = status.ready;
+    if (wasReady && !modelReady) {
+      hoverCache.clear(); state.nheads = null; state.headInfo = null;
+      state.inf = {text:null,pos:-1,sign:state.inf.sign || "both"};
+      $("#inf-toks").innerHTML = ""; $("#run-rows").innerHTML = ""; $("#c-reads").innerHTML = "";
+      map.setHeadLevels(null); map.setMarks([]);
+    }
+  },
+  snapshot() { return {focus:state.focus, layer:state.layer, view:state.view, chat:structuredClone(state.chat),
+    thread:structuredClone(state.thread), tab:curTab(), input:$("#c-input").value, webOn,
+    listHidden:$("#list").classList.contains("hidden"), collapsed:focusEl.classList.contains("collapsed")}; },
+  async select(step) {
+    setView("map");
+    if (step >= 1) {
+      if (!isFocus(22,2742,"neuron")) await openNeuron(22,2742,"neuron",false);
+      setTab(step === 1 || step === 2 ? "details" : "chat");
+      if (step >= 3) { state.chat = {mode:"add",dir:"writes",dose:{add:.8,mul:2}}; showDose(); }
+      setListHidden(true); setFocusCollapsed(step === 1);
+      if (step === 1) map.home();
+    }
+  },
+  async restore(saved) {
+    if (!saved) return;
+    if (saved.focus?.kind === "head" && modelReady) await openHead(saved.focus.layer,saved.focus.n);
+    else if (saved.focus && saved.focus.kind !== "head") await openNeuron(saved.focus.layer,saved.focus.n,saved.focus.kind,false);
+    else $("#f-close").onclick();
+    if (saved.layer !== state.layer) await setLayer(saved.layer);
+    state.chat = saved.chat; state.thread = saved.thread; renderThread(); showDose();
+    $("#c-input").value = saved.input; setTab(saved.tab || "details");
+    document.querySelectorAll("#c-mode button").forEach(b => b.classList.toggle("on", b.dataset.m === state.chat.mode));
+    document.querySelectorAll("#c-dir button").forEach(b => b.classList.toggle("on", b.dataset.d === state.chat.dir));
+    $("#tab-chat").classList.toggle("reads", state.chat.dir === "reads");
+    webOn = saved.webOn; webKey = null; refreshWeb(); setView(saved.view);
+    setListHidden(saved.listHidden); setFocusCollapsed(saved.collapsed); saveFocus();
+  }
+});
